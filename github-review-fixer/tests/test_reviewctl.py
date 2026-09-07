@@ -1421,6 +1421,17 @@ class ReviewCtlTests(unittest.TestCase):
             git.choose_push_remote("acme/widgets", "github.example", None)
         self.assertEqual("push_remote_ambiguous", caught.exception.code)
 
+    def test_run_test_cli_preserves_subcommand_and_exact_approved_command(self):
+        command = "python -m unittest discover -s tests -p 'test_review_*.py' -v"
+        args = reviewctl.parser().parse_args([
+            "--repo", str(self.root), "run-test", "--session", "session-example",
+            "--command", command, "--timeout-seconds", "90",
+        ])
+        self.assertEqual(args.command, "run-test")
+        with mock.patch.object(reviewctl, "run_approved_test", return_value={"ok": True}) as run:
+            self.assertEqual(reviewctl.dispatch(args, self.runner), {"ok": True})
+        run.assert_called_once_with(self.root.resolve(), self.runner, "session-example", command, 90)
+
     def test_cli_emits_json_and_nonzero_on_failure(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):

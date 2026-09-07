@@ -3102,7 +3102,7 @@ def parser() -> argparse.ArgumentParser:
 
     run_test = commands.add_parser("run-test")
     run_test.add_argument("--session", required=True)
-    run_test.add_argument("--command", required=True)
+    run_test.add_argument("--command", dest="test_command", required=True)
     run_test.add_argument("--timeout-seconds", type=int, default=300)
     run_test.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
 
@@ -3220,7 +3220,7 @@ def dispatch(args: argparse.Namespace, runner: Runner) -> dict[str, Any]:
     if args.command == "approve-test-plan":
         return approve_test_plan(cwd, runner, args.session, args.commands_file, args.plan_digest)
     if args.command == "run-test":
-        return run_approved_test(cwd, runner, args.session, args.command, args.timeout_seconds)
+        return run_approved_test(cwd, runner, args.session, args.test_command, args.timeout_seconds)
     if args.command == "prepare-publish":
         return prepare_publish(cwd, runner, args.session, args.commit_message)
     if args.command == "publish":
