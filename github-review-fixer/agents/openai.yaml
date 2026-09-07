@@ -1,6 +1,6 @@
 interface:
   display_name: "GitHub Review Fixer"
-  short_description: "Safely process and publish PR review fixes"
-  default_prompt: "Use $github-review-fixer to process the unresolved line-level review threads on my pull request."
+  short_description: "Review PRs or safely publish review fixes"
+  default_prompt: "Use $github-review-fixer to review my pull request or process its unresolved line-level review threads, and publish only after I approve the exact plan."
 policy:
   allow_implicit_invocation: true

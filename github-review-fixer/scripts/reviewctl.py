@@ -14,9 +14,11 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -33,7 +35,7 @@ except ImportError:  # Unix
     msvcrt = None  # type: ignore[assignment]
 
 
-VERSION = 1
+VERSION = 2
 STATE_DIR_NAME = "codex-review-fixer"
 MARKER_PREFIX = "codex-review-fixer"
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -41,12 +43,13 @@ NODE_ID_RE = re.compile(r"^[A-Za-z0-9_=-]+$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 CHOICE_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
-INTAKE_MODES = ("read-only", "preview", "full", "custom")
+INTAKE_MODES = ("read-only", "preview", "full", "review", "custom")
 CHECKPOINT_KINDS = (
     "environment",
     "change-approval",
     "reply-approval",
     "publication-approval",
+    "rereview",
     "blocked",
     "completed",
 )
@@ -55,7 +58,31 @@ OID_RE = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 SECRET_PATTERNS = (
     re.compile(r"(?i)(authorization\s*:\s*)(?:bearer|token)\s+\S+"),
     re.compile(r"\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{12,}\b"),
+    re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+    re.compile(r"\bAIza[A-Za-z0-9_-]{30,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b"),
+    re.compile(
+        r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----[\s\S]*?"
+        r"-----END (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"
+    ),
+    re.compile(
+        r"(?i)((?:api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*[:=]\s*[\"']?)"
+        r"[A-Za-z0-9_./+=-]{12,}"
+    ),
 )
+
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 60
+PUSH_TIMEOUT_SECONDS = 120
+MAX_TEST_TIMEOUT_SECONDS = 1800
+SHELL_CONTROL_TOKENS = {";", "&&", "||", "|", "<", ">", ">>", "2>", "2>>"}
+REVIEW_SEVERITIES = ("suggestion", "warning", "blocker")
+REVIEW_CONFIDENCE_FLOOR = 0.8
+MAX_REVIEW_COMMENTS = 10
+REVIEW_CATEGORY_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+FIX_SEVERITIES = ("nitpick", "suggestion", "warning", "blocker")
+EVIDENCE_GRADES = ("proven", "plausible", "unsupported")
 
 
 THREADS_QUERY = """
@@ -166,7 +193,7 @@ class ReviewError(RuntimeError):
     def as_json(self) -> dict[str, Any]:
         result: dict[str, Any] = {"code": self.code, "message": redact(self.message)}
         if self.details is not None:
-            result["details"] = self.details
+            result["details"] = redact_json(self.details)
         return result
 
 
@@ -188,7 +215,12 @@ class Runner:
         cwd: Path,
         check: bool = True,
         input_text: str | None = None,
+        timeout_seconds: int | None = None,
     ) -> CommandResult:
+        timeout = timeout_seconds or (
+            PUSH_TIMEOUT_SECONDS if len(argv) > 1 and argv[0] == "git" and argv[1] == "push"
+            else DEFAULT_COMMAND_TIMEOUT_SECONDS
+        )
         try:
             process = subprocess.run(
                 list(argv),
@@ -200,7 +232,13 @@ class Runner:
                 shell=False,
                 env={**os.environ, "LC_ALL": "C"},
                 check=False,
+                timeout=timeout,
             )
+        except subprocess.TimeoutExpired as exc:
+            raise ReviewError(
+                "command_timeout",
+                f"{argv[0]} exceeded the {timeout}-second timeout",
+            ) from exc
         except OSError as exc:
             raise ReviewError("command_unavailable", f"Cannot run {argv[0]}: {exc}") from exc
         result = CommandResult(tuple(argv), process.returncode, process.stdout, process.stderr)
@@ -211,6 +249,29 @@ class Runner:
                 {"stderr": redact(result.stderr[-4000:])},
             )
         return result
+
+
+def parse_approved_command(command: str) -> list[str]:
+    """Parse an explicitly approved command without invoking a shell."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        lexical_tokens = list(lexer)
+        argv = shlex.split(command, posix=True)
+    except ValueError as exc:
+        raise ReviewError("invalid_test_command", "Test command has invalid shell quoting") from exc
+    has_shell_control = any(
+        token in SHELL_CONTROL_TOKENS or (token and all(character in ";&|<>" for character in token))
+        for token in lexical_tokens
+    )
+    has_substitution = any("$(" in token or "`" in token for token in lexical_tokens)
+    if not argv or has_shell_control or has_substitution:
+        raise ReviewError(
+            "unsafe_test_command",
+            "Test commands must be a single executable invocation without shell control operators; use env KEY=VALUE when needed",
+        )
+    return argv
 
 
 def _json_output(result: CommandResult, operation: str) -> Any:
@@ -358,12 +419,13 @@ def task_intake_options(pr_url: str | None, workspace_root: Path | None) -> dict
                     "read-only": "Inspect only; no repository edits.",
                     "preview": "Edit and test locally; stop before publication.",
                     "full": "Edit and test, then offer a separately approved publication plan.",
-                    "custom": "Use an explicit custom_mode description; publication approval remains mandatory.",
+                    "review": "Review the PR without edits, then offer approved COMMENT review publication.",
+                    "custom": "Use a description plus explicit allow_edits and allow_publish booleans; publication approval remains mandatory.",
                 },
             },
         ],
         "confirmation_required": True,
-        "next": "Write all four explicit selections to JSON and rerun task-intake with --config-file.",
+        "next": "Provisionally confirm path, PR, and mode; locate the checkout and inspect local test metadata; then write all four final selections to JSON and rerun task-intake with --config-file.",
     }
 
 
@@ -375,26 +437,44 @@ def normalize_task_intake(value: Mapping[str, Any]) -> dict[str, Any]:
     repository_path = normalize_absolute_path(str(value["repository_path"]), "Repository path")
     pr = parse_explicit_pr_url(str(value["pr_url"]))
     commands = value["test_commands"]
-    if not isinstance(commands, list) or not commands or not all(isinstance(item, str) for item in commands):
-        raise ReviewError("invalid_test_commands", "test_commands must be a nonempty JSON string array")
+    if not isinstance(commands, list) or not all(isinstance(item, str) for item in commands):
+        raise ReviewError("invalid_test_commands", "test_commands must be a JSON string array")
     normalized_commands: list[str] = []
     for command in commands:
         command = reject_sensitive(command.strip(), "Test command")
         if not command or "\0" in command or len(command) > 4096:
             raise ReviewError("invalid_test_command", "Each test command must be nonempty and at most 4096 characters")
-        normalized_commands.append(command)
+        parse_approved_command(command)
+        if command not in normalized_commands:
+            normalized_commands.append(command)
     mode = value["mode"]
     if mode not in INTAKE_MODES:
         raise ReviewError("invalid_intake_mode", f"mode must be one of: {', '.join(INTAKE_MODES)}")
+    if mode != "review" and not normalized_commands:
+        raise ReviewError("invalid_test_commands", "Non-review modes require at least one test command")
+    if mode == "review" and normalized_commands:
+        raise ReviewError("review_tests_not_allowed", "Review mode does not execute project tests; use an empty test_commands array")
     custom_mode = value.get("custom_mode")
+    custom_permissions = value.get("custom_permissions")
     if mode == "custom":
         if not isinstance(custom_mode, str) or not custom_mode.strip():
             raise ReviewError("custom_mode_required", "custom mode requires a nonempty custom_mode description")
         custom_mode = reject_sensitive(custom_mode.strip(), "Custom mode")
+        if not isinstance(custom_permissions, dict) or set(custom_permissions) != {"allow_edits", "allow_publish"}:
+            raise ReviewError(
+                "custom_permissions_required",
+                "custom mode requires boolean allow_edits and allow_publish permissions",
+            )
+        if not all(isinstance(custom_permissions[key], bool) for key in custom_permissions):
+            raise ReviewError("invalid_custom_permissions", "Custom permissions must be booleans")
+        if custom_permissions["allow_publish"] and not custom_permissions["allow_edits"]:
+            raise ReviewError("invalid_custom_permissions", "Publishing requires edit permission")
     elif custom_mode not in (None, ""):
         raise ReviewError("custom_mode_not_allowed", "custom_mode is only valid when mode is custom")
+    elif custom_permissions not in (None, {}):
+        raise ReviewError("custom_permissions_not_allowed", "custom_permissions are only valid when mode is custom")
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "repository_path": repository_path,
         "pr_url": pr["url"],
         "repository": f"{pr['host']}/{pr['repository']}",
@@ -402,6 +482,7 @@ def normalize_task_intake(value: Mapping[str, Any]) -> dict[str, Any]:
         "test_commands": normalized_commands,
         "mode": mode,
         "custom_mode": custom_mode if mode == "custom" else None,
+        "custom_permissions": custom_permissions if mode == "custom" else None,
     }
     return result
 
@@ -417,6 +498,34 @@ def task_intake_from_file(path: Path) -> dict[str, Any]:
         "digest": intake_digest,
         "confirmation_phrase": f"Confirm Review Fixer intake {intake_digest}",
     }
+
+
+def confirmed_task_intake(path: Path, supplied_digest: str) -> tuple[dict[str, Any], str]:
+    intake = normalize_task_intake(load_json_file(path, "Task intake file", dict))
+    expected = digest(intake)
+    if supplied_digest != expected:
+        raise ReviewError(
+            "intake_digest_mismatch",
+            "Task intake does not match the explicitly confirmed digest",
+            {"expected": expected, "supplied": supplied_digest},
+        )
+    return intake, expected
+
+
+def mode_allows_edits(intake: Mapping[str, Any]) -> bool:
+    if intake["mode"] in {"preview", "full"}:
+        return True
+    return intake["mode"] == "custom" and bool((intake.get("custom_permissions") or {}).get("allow_edits"))
+
+
+def mode_allows_publish(intake: Mapping[str, Any]) -> bool:
+    if intake["mode"] == "full":
+        return True
+    return intake["mode"] == "custom" and bool((intake.get("custom_permissions") or {}).get("allow_publish"))
+
+
+def mode_allows_review_publish(intake: Mapping[str, Any]) -> bool:
+    return intake["mode"] == "review"
 
 
 def normalize_choices(value: Any) -> list[dict[str, str]]:
@@ -492,10 +601,11 @@ def create_checkpoint(
         "operation": "checkpoint",
         "checkpoint": {**body, "checkpoint_id": checkpoint_id},
         "delivery": {
-            "status": "pending",
+            "status": "not_enqueued",
             "telegram_text": telegram_text,
             "codex_prompt": prompt,
-            "bridge": "BootYourDonkey task transcript/Telegram steer when the task is linked",
+            "required_tool": "bootyourdonkey.send_operator_checkpoint",
+            "bridge": "BootYourDonkey durable operator-notification outbox",
         },
     }
 
@@ -504,7 +614,7 @@ def create_handoff(intake_file: Path, title: str | None) -> dict[str, Any]:
     intake = normalize_task_intake(load_json_file(intake_file, "Task intake file", dict))
     safe_title = reject_sensitive((title or f"Review PR {intake['pr_url']}").strip(), "Handoff title")
     body = {
-        "handoff_version": 1,
+        "handoff_version": VERSION,
         "kind": "bootyourdonkey.review-fixer.request",
         "title": safe_title,
         "objective": "Process unresolved line-level PR review threads with github-review-fixer.",
@@ -516,6 +626,7 @@ def create_handoff(intake_file: Path, title: str | None) -> dict[str, Any]:
                 "change-approval",
                 "reply-approval",
                 "publication-approval",
+                "rereview",
                 "blocked",
                 "completed",
             ],
@@ -542,7 +653,7 @@ def validate_handoff(path: Path) -> dict[str, Any]:
     wrapper = load_json_file(path, "Handoff file", dict)
     body = wrapper.get("handoff")
     supplied_digest = wrapper.get("digest")
-    if not isinstance(body, dict) or body.get("handoff_version") != 1:
+    if not isinstance(body, dict) or body.get("handoff_version") != VERSION:
         raise ReviewError("invalid_handoff", "Handoff payload is missing or unsupported")
     if body.get("kind") != "bootyourdonkey.review-fixer.request":
         raise ReviewError("invalid_handoff", "Handoff kind is not a Review Fixer request")
@@ -692,6 +803,72 @@ class Git:
         raw = self.run(["diff", "--name-only", "--no-renames", "-z", parent, commit]).stdout
         return sorted(filter(None, raw.split("\0")))
 
+    def merge_base(self, base: str, head: str) -> str:
+        return validate_oid(self.run(["merge-base", base, head]).stdout.strip())
+
+    def review_changed_paths(self, base: str, head: str) -> list[str]:
+        raw = self.run(
+            ["-c", "core.quotePath=false", "diff", "--name-only", "--no-renames", "-z", base, head, "--"]
+        ).stdout
+        paths = sorted(filter(None, raw.split("\0")))
+        for value in paths:
+            safe_repo_path(self.root, value)
+            if "\n" in value or "\r" in value or "\t" in value:
+                raise ReviewError("unsupported_review_path", "Review paths cannot contain control whitespace")
+        return paths
+
+    def review_diff(self, base: str, head: str, *, unified: int = 80) -> str:
+        return self.run(
+            [
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                f"--unified={unified}",
+                "--no-renames",
+                base,
+                head,
+                "--",
+            ]
+        ).stdout
+
+    def reviewable_right_lines(self, base: str, head: str) -> dict[str, set[int]]:
+        """Return new-side line numbers that are visibly present in a three-line diff."""
+        raw = self.review_diff(base, head, unified=3)
+        result: dict[str, set[int]] = {}
+        path: str | None = None
+        new_line: int | None = None
+        for line in raw.splitlines():
+            if line.startswith("+++ "):
+                value = line[4:]
+                path = None if value == "/dev/null" else value.removeprefix("b/")
+                if path is not None:
+                    safe_repo_path(self.root, path)
+                    if "\t" in path or "\r" in path:
+                        raise ReviewError("unsupported_review_path", "Review paths cannot contain control whitespace")
+                    result.setdefault(path, set())
+                new_line = None
+                continue
+            match = HUNK_RE.match(line)
+            if match:
+                new_line = int(match.group(1))
+                continue
+            if path is None or new_line is None or not line:
+                continue
+            prefix = line[0]
+            if prefix == "+":
+                result[path].add(new_line)
+                new_line += 1
+            elif prefix == " ":
+                result[path].add(new_line)
+                new_line += 1
+            elif prefix == "-" or prefix == "\\":
+                continue
+            else:
+                new_line = None
+        return result
+
 
 def safe_repo_path(root: Path, value: str) -> Path:
     pure = PurePosixPath(value)
@@ -719,8 +896,14 @@ class GitHub:
             raise ReviewError("repository_host_unknown", "Cannot determine GitHub host from the origin remote")
         return str(parse_host(origin))
 
-    def run(self, args: Sequence[str], *, check: bool = True) -> CommandResult:
-        return self.runner.run(["gh", *args], cwd=self.git.root, check=check)
+    def run(
+        self,
+        args: Sequence[str],
+        *,
+        check: bool = True,
+        input_text: str | None = None,
+    ) -> CommandResult:
+        return self.runner.run(["gh", *args], cwd=self.git.root, check=check, input_text=input_text)
 
     def authenticate(self) -> None:
         self.run(["auth", "status", "--hostname", self.host])
@@ -731,7 +914,10 @@ class GitHub:
 
     def pr(self, selector: str | None) -> dict[str, Any]:
         selector = validate_pr_selector(selector, self.host)
-        fields = "number,url,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,state"
+        fields = (
+            "number,url,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,state,"
+            "body,comments,reviews,statusCheckRollup"
+        )
         args = ["pr", "view"]
         if selector:
             args.append(selector)
@@ -746,6 +932,12 @@ class GitHub:
                 head_repo = f"{head_owner}/{head_name}"
         if not head_repo:
             raise ReviewError("head_repository_missing", "The pull request head repository is unavailable")
+        raw_review_context = {
+            "body": data.get("body") or "",
+            "conversation_comments": data.get("comments") or [],
+            "review_summaries": data.get("reviews") or [],
+            "status_checks": data.get("statusCheckRollup") or [],
+        }
         result = {
             "number": int(data["number"]),
             "url": data["url"],
@@ -754,7 +946,16 @@ class GitHub:
             "head_repository": validate_repo_slug(head_repo),
             "base_repository": repo_slug_from_pr_url(data["url"], self.host),
             "base_ref": data["baseRefName"],
+            "base_oid": validate_oid(data["baseRefOid"]),
             "state": str(data["state"]).upper(),
+            "review_context": redact_json(raw_review_context),
+            "review_feedback_sha256": digest(
+                {
+                    "body": raw_review_context["body"],
+                    "conversation_comments": raw_review_context["conversation_comments"],
+                    "review_summaries": raw_review_context["review_summaries"],
+                }
+            ),
         }
         if result["state"] != "OPEN":
             raise ReviewError("pr_not_open", f"Pull request #{result['number']} is not open")
@@ -836,6 +1037,80 @@ class GitHub:
         if not resolved:
             raise ReviewError("resolve_not_confirmed", f"GitHub did not confirm resolution of {thread_id}")
 
+    def pull_request_reviews(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
+        endpoint = f"repos/{validate_repo_slug(repo)}/pulls/{int(pr_number)}/reviews?per_page=100"
+        data = _json_output(
+            self.run(
+                [
+                    "api",
+                    "--method",
+                    "GET",
+                    "-H",
+                    "Accept: application/vnd.github+json",
+                    "-H",
+                    "X-GitHub-Api-Version: 2022-11-28",
+                    "--paginate",
+                    "--slurp",
+                    endpoint,
+                ]
+            ),
+            "gh api list pull request reviews",
+        )
+        pages = data if isinstance(data, list) else []
+        flattened: list[dict[str, Any]] = []
+        for page in pages:
+            if not isinstance(page, list):
+                raise ReviewError("invalid_github_response", "Review listing returned an invalid page")
+            for raw in page:
+                if not isinstance(raw, dict):
+                    raise ReviewError("invalid_github_response", "Review listing returned an invalid item")
+                flattened.append(
+                    {
+                        "id": raw.get("id"),
+                        "node_id": raw.get("node_id"),
+                        "body": redact(str(raw.get("body") or "")),
+                        "state": raw.get("state"),
+                        "html_url": raw.get("html_url"),
+                        "commit_id": raw.get("commit_id"),
+                    }
+                )
+        return flattened
+
+    def create_pull_request_review(
+        self,
+        repo: str,
+        pr_number: int,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        endpoint = f"repos/{validate_repo_slug(repo)}/pulls/{int(pr_number)}/reviews"
+        data = _json_output(
+            self.run(
+                [
+                    "api",
+                    "--method",
+                    "POST",
+                    "-H",
+                    "Accept: application/vnd.github+json",
+                    "-H",
+                    "X-GitHub-Api-Version: 2022-11-28",
+                    "--input",
+                    "-",
+                    endpoint,
+                ],
+                input_text=canonical_json(payload),
+            ),
+            "gh api create pull request review",
+        )
+        if not isinstance(data, dict) or data.get("id") is None:
+            raise ReviewError("invalid_github_response", "Review creation did not return a review ID")
+        return {
+            "id": data.get("id"),
+            "node_id": data.get("node_id"),
+            "state": data.get("state"),
+            "html_url": data.get("html_url"),
+            "commit_id": data.get("commit_id"),
+        }
+
 
 def normalize_comment(raw: Mapping[str, Any]) -> dict[str, Any]:
     author = raw.get("author") or {}
@@ -892,6 +1167,29 @@ def thread_comments_fingerprint(thread: Mapping[str, Any], *, ignore_marker: str
     return digest({"thread_id": thread["thread_id"], "comments": comments})
 
 
+def review_feedback_fingerprint(pr: Mapping[str, Any]) -> str:
+    if isinstance(pr.get("review_feedback_sha256"), str):
+        return str(pr["review_feedback_sha256"])
+    context = pr.get("review_context") or {}
+    return digest(
+        {
+            "body": context.get("body") or "",
+            "conversation_comments": context.get("conversation_comments") or [],
+            "review_summaries": context.get("review_summaries") or [],
+        }
+    )
+
+
+def ensure_review_feedback_unchanged(session: Mapping[str, Any], pr: Mapping[str, Any]) -> None:
+    if session.get("legacy_session"):
+        return
+    if review_feedback_fingerprint(pr) != session.get("review_feedback_fingerprint"):
+        raise ReviewError(
+            "pr_feedback_drift",
+            "PR body, conversation comments, or review summaries changed; reanalysis is required",
+        )
+
+
 class SessionStore:
     def __init__(self, git_dir: Path):
         self.root = git_dir / STATE_DIR_NAME
@@ -938,8 +1236,39 @@ class SessionStore:
             try:
                 with candidate.open("r", encoding="utf-8") as handle:
                     data = json.load(handle)
-                if data.get("version") != VERSION or data.get("session_id") != session_id:
+                if data.get("session_id") != session_id or data.get("version") not in {1, VERSION}:
                     raise ValueError("identity mismatch")
+                if data.get("version") == 1:
+                    publication_started = (data.get("publication") or {}).get("status") != "not_started"
+                    commands = sorted(
+                        {
+                            test.get("command")
+                            for entry in (data.get("threads") or {}).values()
+                            for test in entry.get("tests") or []
+                            if isinstance(test, dict) and isinstance(test.get("command"), str)
+                        }
+                    )
+                    data["version"] = VERSION
+                    data["legacy_session"] = True
+                    data["intake"] = {
+                        "schema_version": 1,
+                        "mode": "full" if publication_started else "preview",
+                        "custom_permissions": None,
+                    }
+                    data["intake_digest"] = "legacy-unbound"
+                    data["approved_test_commands"] = commands
+                    data["test_runs"] = {}
+                    data["kind"] = "fix"
+                    for entry in (data.get("threads") or {}).values():
+                        entry.setdefault("resolution", "resolve")
+                data.setdefault("kind", "fix")
+                data.setdefault(
+                    "quality_policy",
+                    {
+                        "require_assessment": False,
+                        "source": "compatibility-session",
+                    },
+                )
                 if recovered:
                     data["recovered_from_backup"] = True
                 return data
@@ -985,7 +1314,13 @@ def repository_context(cwd: Path, runner: Runner) -> tuple[Git, GitHub, dict[str
     return git, github, repo
 
 
-def inspect(cwd: Path, runner: Runner, selector: str | None) -> dict[str, Any]:
+def inspect(
+    cwd: Path,
+    runner: Runner,
+    selector: str | None,
+    intake: Mapping[str, Any] | None = None,
+    intake_digest: str | None = None,
+) -> dict[str, Any]:
     git, github, repo = repository_context(cwd, runner)
     pr = github.pr(selector)
     if pr["base_repository"] != repo["name_with_owner"]:
@@ -994,6 +1329,12 @@ def inspect(cwd: Path, runner: Runner, selector: str | None) -> dict[str, Any]:
             "Selected pull request does not belong to the current repository",
             {"current": repo["name_with_owner"], "selected": pr["base_repository"]},
         )
+    if intake is not None:
+        if Path(str(intake["repository_path"])).resolve() != git.root:
+            raise ReviewError("intake_repository_mismatch", "Current checkout does not match the confirmed intake path")
+        expected_repository = f"{repo['host']}/{repo['name_with_owner']}"
+        if intake["repository"] != expected_repository or intake["pr_url"] != pr["url"]:
+            raise ReviewError("intake_pr_mismatch", "Selected repository or PR does not match the confirmed intake")
     threads = github.threads(repo["name_with_owner"], pr["number"])
     local_head = git.head()
     entries = git.status_entries()
@@ -1002,6 +1343,7 @@ def inspect(cwd: Path, runner: Runner, selector: str | None) -> dict[str, Any]:
     return {
         "ok": True,
         "operation": "inspect",
+        "intake_digest": intake_digest,
         "repository": repo,
         "pr": pr,
         "threads": threads,
@@ -1022,9 +1364,13 @@ def create_session(
     runner: Runner,
     selector: str | None,
     push_remote: str | None,
+    intake: Mapping[str, Any],
+    intake_digest: str,
     requested_id: str | None = None,
 ) -> dict[str, Any]:
-    report = inspect(cwd, runner, selector)
+    if not mode_allows_edits(intake):
+        raise ReviewError("mode_forbids_edits", "The confirmed intake mode does not allow an edit session")
+    report = inspect(cwd, runner, selector, intake, intake_digest)
     checkout = report["checkout"]
     if not checkout["usable"]:
         raise ReviewError(
@@ -1040,12 +1386,24 @@ def create_session(
     threads = report["threads"]
     session = {
         "version": VERSION,
+        "kind": "fix",
         "session_id": session_id,
         "created_at": utc_now(),
         "updated_at": utc_now(),
         "revision": 0,
+        "intake": dict(intake),
+        "intake_digest": intake_digest,
+        "approved_test_commands": list(intake["test_commands"]),
+        "test_runs": {},
+        "quality_policy": {
+            "require_assessment": True,
+            "source": "mira-inspired-evidence-triage",
+            "confidence_floor": REVIEW_CONFIDENCE_FLOOR,
+            "evidence_grades": list(EVIDENCE_GRADES),
+        },
         "repository": {**report["repository"], "root": str(git.root), "git_dir": str(git.git_dir())},
         "pr": report["pr"],
+        "review_feedback_fingerprint": review_feedback_fingerprint(report["pr"]),
         "expected_head": report["pr"]["head_oid"],
         "latest_observed_head": report["pr"]["head_oid"],
         "initial_status": checkout["status"],
@@ -1058,9 +1416,11 @@ def create_session(
                 "comments_fingerprint": thread_comments_fingerprint(thread),
                 "state": "pending",
                 "decision": None,
+                "resolution": None,
                 "reply": None,
                 "paths": [],
                 "tests": [],
+                "assessment": None,
                 "reply_result": None,
                 "resolved": False,
                 "error": None,
@@ -1074,6 +1434,67 @@ def create_session(
             raise ReviewError("session_exists", f"Session {session_id!r} already exists")
         store.save(session)
     return {"ok": True, "operation": "session-start", "session": session}
+
+
+def create_review_session(
+    cwd: Path,
+    runner: Runner,
+    selector: str | None,
+    intake: Mapping[str, Any],
+    intake_digest: str,
+    requested_id: str | None = None,
+) -> dict[str, Any]:
+    if not mode_allows_review_publish(intake):
+        raise ReviewError("mode_forbids_review", "A reviewer session requires confirmed review mode")
+    report = inspect(cwd, runner, selector, intake, intake_digest)
+    checkout = report["checkout"]
+    if not checkout["usable"]:
+        raise ReviewError(
+            "isolation_required",
+            "Reviewer mode requires a clean checkout at the exact PR head",
+            checkout,
+        )
+    git = Git(Path(checkout["root"]), runner)
+    diff_base = git.merge_base(report["pr"]["base_oid"], report["pr"]["head_oid"])
+    changed_paths = git.review_changed_paths(diff_base, report["pr"]["head_oid"])
+    session_id = requested_id or f"review-pr-{report['pr']['number']}-{uuid.uuid4().hex}"
+    if not SESSION_RE.fullmatch(session_id):
+        raise ReviewError("invalid_session_id", "Invalid requested session ID")
+    threads = report["threads"]
+    session = {
+        "version": VERSION,
+        "kind": "review",
+        "session_id": session_id,
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+        "revision": 0,
+        "intake": dict(intake),
+        "intake_digest": intake_digest,
+        "repository": {**report["repository"], "root": str(git.root), "git_dir": str(git.git_dir())},
+        "pr": report["pr"],
+        "expected_head": report["pr"]["head_oid"],
+        "expected_base": report["pr"]["base_oid"],
+        "diff_base": diff_base,
+        "review_feedback_fingerprint": review_feedback_fingerprint(report["pr"]),
+        "thread_order": [thread["thread_id"] for thread in threads],
+        "thread_fingerprints": {
+            thread["thread_id"]: thread_fingerprint(thread) for thread in threads
+        },
+        "changed_paths": changed_paths,
+        "publication": {
+            "status": "not_started",
+            "plan": None,
+            "digest": None,
+            "review_result": None,
+            "last_error": None,
+        },
+    }
+    store = SessionStore(git.git_dir())
+    with store.lock():
+        if store.path(session_id).exists():
+            raise ReviewError("session_exists", f"Session {session_id!r} already exists")
+        store.save(session)
+    return {"ok": True, "operation": "review-start", "session": session}
 
 
 def load_paths(path: Path | None) -> list[str]:
@@ -1091,30 +1512,110 @@ def load_paths(path: Path | None) -> list[str]:
     return sorted(set(paths))
 
 
-def load_tests(path: Path | None) -> list[dict[str, Any]]:
+def load_tests(path: Path | None) -> list[str]:
     if path is None:
         return []
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ReviewError("invalid_tests_file", "Tests file must contain valid JSON") from exc
-    if not isinstance(value, list):
-        raise ReviewError("invalid_tests_file", "Tests JSON must be an array")
-    normalized: list[dict[str, Any]] = []
-    for item in value:
-        if not isinstance(item, dict) or not isinstance(item.get("command"), str):
-            raise ReviewError("invalid_tests_file", "Each test needs a display-only command string")
-        status = item.get("status")
-        if status not in {"passed", "failed", "unavailable", "not_run"}:
-            raise ReviewError("invalid_tests_file", "Test status must be passed, failed, unavailable, or not_run")
-        normalized.append(
-            {
-                "command": redact(item["command"]),
-                "status": status,
-                "summary": redact(str(item.get("summary") or "")),
-            }
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ReviewError("invalid_tests_file", "Tests JSON must be an array of recorded test evidence IDs")
+    return list(dict.fromkeys(value))
+
+
+def load_fix_assessment(path: Path | None, git: Git) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    raw = load_json_file(path, "Fix assessment file", dict)
+    required = {
+        "category",
+        "severity",
+        "confidence",
+        "evidence_grade",
+        "rationale",
+        "related_paths",
+        "regression_risks",
+        "verification_scope",
+    }
+    allowed = required | {"duplicate_of"}
+    if set(raw) - allowed or required - set(raw):
+        raise ReviewError(
+            "invalid_fix_assessment",
+            "Fix assessment must contain exactly the required evidence-triage fields",
+            {"required": sorted(required), "optional": ["duplicate_of"]},
         )
-    return normalized
+    category = raw["category"]
+    if not isinstance(category, str) or not REVIEW_CATEGORY_RE.fullmatch(category):
+        raise ReviewError("invalid_fix_category", "Fix assessment category is invalid")
+    severity = raw["severity"]
+    if severity not in FIX_SEVERITIES:
+        raise ReviewError("invalid_fix_severity", "Fix assessment severity is invalid")
+    confidence = raw["confidence"]
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+        raise ReviewError("invalid_fix_confidence", "Fix assessment confidence must be between 0 and 1")
+    evidence_grade = raw["evidence_grade"]
+    if evidence_grade not in EVIDENCE_GRADES:
+        raise ReviewError("invalid_evidence_grade", "evidence_grade must be proven, plausible, or unsupported")
+    rationale = raw["rationale"]
+    if not isinstance(rationale, str):
+        raise ReviewError("invalid_fix_rationale", "Fix assessment rationale must be a string")
+    rationale = reject_sensitive(rationale.strip(), "Fix assessment rationale")
+    if not rationale or len(rationale) > 6000:
+        raise ReviewError("invalid_fix_rationale", "Fix assessment rationale must be nonempty and at most 6000 characters")
+    related_paths = raw["related_paths"]
+    if not isinstance(related_paths, list) or not related_paths or not all(isinstance(item, str) for item in related_paths):
+        raise ReviewError("invalid_related_paths", "related_paths must be a nonempty JSON string array")
+    normalized_paths: list[str] = []
+    for item in related_paths:
+        item = reject_sensitive(item, "Related path")
+        safe_repo_path(git.root, item)
+        if item not in normalized_paths:
+            normalized_paths.append(item)
+
+    def normalize_notes(key: str) -> list[str]:
+        value = raw[key]
+        if not isinstance(value, list) or len(value) > 20 or not all(isinstance(item, str) for item in value):
+            raise ReviewError("invalid_fix_assessment_notes", f"{key} must be a JSON string array with at most 20 entries")
+        notes: list[str] = []
+        for item in value:
+            item = reject_sensitive(item.strip(), f"Fix assessment {key}")
+            if not item or len(item) > 1000:
+                raise ReviewError("invalid_fix_assessment_notes", f"Each {key} entry must be nonempty and at most 1000 characters")
+            if item not in notes:
+                notes.append(item)
+        return notes
+
+    duplicate_of = raw.get("duplicate_of")
+    if duplicate_of is not None and (not isinstance(duplicate_of, str) or not NODE_ID_RE.fullmatch(duplicate_of)):
+        raise ReviewError("invalid_duplicate_thread", "duplicate_of must be a valid review thread ID or null")
+    return {
+        "category": category,
+        "severity": severity,
+        "confidence": float(confidence),
+        "evidence_grade": evidence_grade,
+        "rationale": rationale,
+        "related_paths": normalized_paths,
+        "regression_risks": normalize_notes("regression_risks"),
+        "verification_scope": normalize_notes("verification_scope"),
+        "duplicate_of": duplicate_of,
+    }
+
+
+def resolve_test_evidence(session: Mapping[str, Any], evidence_ids: Sequence[str]) -> list[dict[str, Any]]:
+    runs = session.get("test_runs") or {}
+    resolved: list[dict[str, Any]] = []
+    for evidence_id in evidence_ids:
+        evidence = runs.get(evidence_id)
+        if not isinstance(evidence, dict) or evidence.get("evidence_id") != evidence_id:
+            raise ReviewError("test_evidence_missing", f"Unknown test evidence ID: {evidence_id}")
+        material = {key: value for key, value in evidence.items() if key != "evidence_id"}
+        if digest(material) != evidence_id:
+            raise ReviewError("test_evidence_corrupt", f"Test evidence failed its digest check: {evidence_id}")
+        if evidence.get("command") not in session.get("approved_test_commands", []):
+            raise ReviewError("test_command_not_approved", "Test evidence uses a command outside the approved test plan")
+        resolved.append(dict(evidence))
+    return resolved
 
 
 def record_decision(
@@ -1123,53 +1624,89 @@ def record_decision(
     session_id: str,
     thread_id: str,
     decision: str,
-    reply_file: Path,
+    resolution: str | None,
+    reply_file: Path | None,
     paths_file: Path | None,
     tests_file: Path | None,
+    assessment_file: Path | None = None,
 ) -> dict[str, Any]:
     git = Git.discover(cwd, runner)
     store = SessionStore(git.git_dir())
-    try:
-        reply = reply_file.read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        raise ReviewError("reply_file_unreadable", f"Cannot read reply file: {exc}") from exc
-    if not reply:
-        raise ReviewError("empty_reply", "Confirmed reply text cannot be empty")
-    if redact(reply) != reply:
-        raise ReviewError("sensitive_reply", "Confirmed reply contains token-shaped content and will not be stored or published")
+    reply = None
+    if decision != "defer":
+        if reply_file is None:
+            raise ReviewError("reply_file_required", "A change or no-change decision requires a reply file")
+        try:
+            reply = reply_file.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ReviewError("reply_file_unreadable", f"Cannot read reply file: {exc}") from exc
+        if not reply:
+            raise ReviewError("empty_reply", "Confirmed reply text cannot be empty")
+        if redact(reply) != reply:
+            raise ReviewError("sensitive_reply", "Confirmed reply contains token-shaped content and will not be stored or published")
     paths = load_paths(paths_file)
-    tests = load_tests(tests_file)
+    evidence_ids = load_tests(tests_file)
+    assessment = load_fix_assessment(assessment_file, git)
     for value in paths:
         safe_repo_path(git.root, value)
     if decision == "change" and not paths:
         raise ReviewError("paths_required", "A change decision must record at least one path")
-    if decision == "change" and not tests:
+    if decision == "change" and not evidence_ids:
         raise ReviewError("tests_required", "A change decision must record test evidence")
-    if decision == "no-change" and paths:
-        raise ReviewError("paths_not_allowed", "A no-change decision cannot record changed paths")
+    if decision == "no-change" and (paths or evidence_ids):
+        raise ReviewError("change_evidence_not_allowed", "A no-change decision cannot record changed paths or test runs")
+    if decision in {"change", "no-change"} and resolution not in {"resolve", "leave-open"}:
+        raise ReviewError("resolution_required", "Choose resolve or leave-open for a publishable decision")
+    if decision == "defer" and (reply_file is not None or paths or evidence_ids or resolution is not None):
+        raise ReviewError("defer_fields_not_allowed", "A deferred thread cannot include a reply, paths, tests, or resolution")
     with store.lock():
         session = store.load(session_id)
         ensure_same_repo(session, git)
+        ensure_session_kind(session, "fix")
+        tests = resolve_test_evidence(session, evidence_ids)
         if session["publication"]["status"] != "not_started":
             raise ReviewError("publication_started", "Decisions cannot change after publication has started")
         if thread_id not in session["threads"]:
             raise ReviewError("thread_not_in_session", f"Thread {thread_id!r} is not in this session")
+        if session.get("quality_policy", {}).get("require_assessment") and decision != "defer" and assessment is None:
+            raise ReviewError(
+                "fix_assessment_required",
+                "This session requires a Mira-style evidence assessment before recording a publishable decision",
+            )
+        if assessment is not None:
+            duplicate_of = assessment.get("duplicate_of")
+            if duplicate_of is not None and (duplicate_of == thread_id or duplicate_of not in session["threads"]):
+                raise ReviewError("invalid_duplicate_thread", "duplicate_of must identify a different thread in this session")
+            thread_path = session["threads"][thread_id]["snapshot"].get("path")
+            if decision != "defer" and thread_path and thread_path not in assessment["related_paths"]:
+                raise ReviewError("thread_path_not_assessed", "related_paths must include the reviewed thread path")
+            if decision == "change" and not set(paths).issubset(assessment["related_paths"]):
+                raise ReviewError("changed_path_not_assessed", "Every changed path must be included in assessment related_paths")
+            if decision == "change" and assessment["evidence_grade"] == "unsupported":
+                raise ReviewError("unsupported_change", "An unsupported finding cannot be recorded as a code change")
         pending = [
             item
             for item in session["thread_order"]
             if session["threads"][item]["state"] == "pending"
         ]
         entry = session["threads"][thread_id]
-        proposed = {"decision": decision, "reply": reply, "paths": paths, "tests": tests}
+        proposed = {
+            "decision": decision,
+            "resolution": resolution,
+            "reply": reply,
+            "paths": paths,
+            "tests": tests,
+            "assessment": assessment,
+        }
         existing = {key: entry.get(key) for key in proposed}
-        if entry["state"] == "ready" and existing == proposed:
+        if entry["state"] in {"ready", "deferred"} and existing == proposed:
             return {"ok": True, "operation": "record", "idempotent": True, "thread": entry}
         if entry["state"] != "pending":
             raise ReviewError("decision_already_recorded", "Thread already has a different confirmed decision")
         if not pending or pending[0] != thread_id:
             raise ReviewError("thread_out_of_order", f"Record the next pending thread first: {pending[0] if pending else 'none'}")
         entry.update(proposed)
-        entry["state"] = "ready"
+        entry["state"] = "deferred" if decision == "defer" else "ready"
         entry["confirmed_at"] = utc_now()
         store.save(session)
         return {"ok": True, "operation": "record", "idempotent": False, "thread": entry}
@@ -1185,12 +1722,13 @@ def update_tests(
     """Replace test evidence for a confirmed change before publication starts."""
     git = Git.discover(cwd, runner)
     store = SessionStore(git.git_dir())
-    tests = load_tests(tests_file)
-    if not tests:
+    evidence_ids = load_tests(tests_file)
+    if not evidence_ids:
         raise ReviewError("tests_required", "Updated test evidence cannot be empty")
     with store.lock():
         session = store.load(session_id)
         ensure_same_repo(session, git)
+        ensure_session_kind(session, "fix")
         if session["publication"]["status"] != "not_started":
             raise ReviewError("publication_started", "Test evidence cannot change after publication has started")
         if thread_id not in session["threads"]:
@@ -1201,6 +1739,7 @@ def update_tests(
                 "tests_not_updateable",
                 "Test evidence can only be updated for a confirmed change",
             )
+        tests = resolve_test_evidence(session, evidence_ids)
         if entry.get("tests") == tests:
             return {
                 "ok": True,
@@ -1219,9 +1758,174 @@ def update_tests(
         }
 
 
+def load_test_commands_file(path: Path) -> list[str]:
+    value = load_json_file(path, "Test commands file", list)
+    if not value or not all(isinstance(item, str) for item in value):
+        raise ReviewError("invalid_test_commands", "Test commands must be a nonempty JSON string array")
+    commands: list[str] = []
+    for item in value:
+        command = reject_sensitive(item.strip(), "Test command")
+        if not command or len(command) > 4096 or "\0" in command:
+            raise ReviewError("invalid_test_command", "Each test command must be nonempty and at most 4096 characters")
+        parse_approved_command(command)
+        if command not in commands:
+            commands.append(command)
+    return commands
+
+
+def build_test_plan(session: Mapping[str, Any], proposed: Sequence[str]) -> dict[str, Any]:
+    current = list(session.get("approved_test_commands") or [])
+    if any(command not in proposed for command in current):
+        raise ReviewError("test_plan_cannot_remove", "An in-progress session may add approved tests but cannot remove them")
+    plan = {
+        "version": VERSION,
+        "session_id": session["session_id"],
+        "intake_digest": session["intake_digest"],
+        "current_commands": current,
+        "proposed_commands": list(proposed),
+    }
+    plan["digest"] = digest(plan)
+    return plan
+
+
+def prepare_test_plan(cwd: Path, runner: Runner, session_id: str, commands_file: Path) -> dict[str, Any]:
+    git = Git.discover(cwd, runner)
+    store = SessionStore(git.git_dir())
+    proposed = load_test_commands_file(commands_file)
+    with store.lock(exclusive=False):
+        session = store.load(session_id)
+        ensure_same_repo(session, git)
+        ensure_session_kind(session, "fix")
+        if session["publication"]["status"] != "not_started":
+            raise ReviewError("publication_started", "The test plan cannot change after publication starts")
+        plan = build_test_plan(session, proposed)
+    return {"ok": True, "operation": "prepare-test-plan", "plan": plan}
+
+
+def approve_test_plan(
+    cwd: Path,
+    runner: Runner,
+    session_id: str,
+    commands_file: Path,
+    plan_digest: str,
+) -> dict[str, Any]:
+    git = Git.discover(cwd, runner)
+    store = SessionStore(git.git_dir())
+    proposed = load_test_commands_file(commands_file)
+    with store.lock():
+        session = store.load(session_id)
+        ensure_same_repo(session, git)
+        ensure_session_kind(session, "fix")
+        if session["publication"]["status"] != "not_started":
+            raise ReviewError("publication_started", "The test plan cannot change after publication starts")
+        plan = build_test_plan(session, proposed)
+        if plan["digest"] != plan_digest:
+            raise ReviewError("test_plan_digest_mismatch", "The approved test plan digest is not current")
+        if proposed == session.get("approved_test_commands"):
+            return {"ok": True, "operation": "approve-test-plan", "idempotent": True, "plan": plan}
+        session["approved_test_commands"] = proposed
+        session.setdefault("test_plan_revisions", []).append(
+            {"approved_at": utc_now(), "digest": plan_digest, "commands": proposed}
+        )
+        store.save(session)
+    return {"ok": True, "operation": "approve-test-plan", "idempotent": False, "plan": plan}
+
+
+def run_approved_test(
+    cwd: Path,
+    runner: Runner,
+    session_id: str,
+    command: str,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    if timeout_seconds < 1 or timeout_seconds > MAX_TEST_TIMEOUT_SECONDS:
+        raise ReviewError("invalid_test_timeout", f"Test timeout must be between 1 and {MAX_TEST_TIMEOUT_SECONDS} seconds")
+    git = Git.discover(cwd, runner)
+    store = SessionStore(git.git_dir())
+    with store.lock(exclusive=False):
+        session = store.load(session_id)
+        ensure_same_repo(session, git)
+        ensure_session_kind(session, "fix")
+        if not mode_allows_edits(session["intake"]):
+            raise ReviewError("mode_forbids_tests", "The confirmed intake mode does not allow project tests")
+        if session["publication"]["status"] != "not_started":
+            raise ReviewError("publication_started", "Project tests cannot run after publication starts")
+        if command not in session.get("approved_test_commands", []):
+            raise ReviewError("test_command_not_approved", "The exact test command is not in the approved test plan")
+    argv = parse_approved_command(command)
+    before_head = git.head()
+    before_status = git.status_entries()
+    started_at = utc_now()
+    started = time.monotonic()
+    execution_error: ReviewError | None = None
+    try:
+        result = runner.run(argv, cwd=git.root, check=False, timeout_seconds=timeout_seconds)
+    except ReviewError as error:
+        if error.code not in {"command_timeout", "command_unavailable"}:
+            raise
+        execution_error = error
+        result = CommandResult(tuple(argv), -1, "", "")
+    duration = round(time.monotonic() - started, 3)
+    finished_at = utc_now()
+    after_head = git.head()
+    after_status = git.status_entries()
+    repository_changed = before_head != after_head or before_status != after_status
+    status = (
+        "unavailable" if execution_error
+        else "passed" if result.returncode == 0 and not repository_changed
+        else "failed"
+    )
+    raw_summary = (
+        execution_error.message
+        if execution_error
+        else next(
+            (line.strip() for line in reversed((result.stderr + "\n" + result.stdout).splitlines()) if line.strip()),
+            "no output",
+        )
+    )
+    evidence = {
+        "command": command,
+        "argv": argv,
+        "status": status,
+        "exit_code": None if execution_error else result.returncode,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_seconds": duration,
+        "stdout_sha256": hashlib.sha256(result.stdout.encode("utf-8")).hexdigest(),
+        "stderr_sha256": hashlib.sha256(result.stderr.encode("utf-8")).hexdigest(),
+        "summary": redact(raw_summary[-500:]),
+        "stdout_tail": redact(result.stdout[-2000:]),
+        "stderr_tail": redact(result.stderr[-2000:]),
+        "repository_changed": repository_changed,
+        "execution_error": execution_error.as_json() if execution_error else None,
+    }
+    evidence_id = digest(evidence)
+    evidence["evidence_id"] = evidence_id
+    with store.lock():
+        session = store.load(session_id)
+        ensure_same_repo(session, git)
+        ensure_session_kind(session, "fix")
+        if session["publication"]["status"] != "not_started":
+            raise ReviewError("publication_started", "Test completed after publication started; evidence was not recorded")
+        if command not in session.get("approved_test_commands", []):
+            raise ReviewError("test_command_not_approved", "The test plan changed while the test was running")
+        session.setdefault("test_runs", {})[evidence_id] = evidence
+        store.save(session)
+    return {"ok": True, "operation": "run-test", "evidence": evidence}
+
+
 def ensure_same_repo(session: Mapping[str, Any], git: Git) -> None:
     if Path(session["repository"]["root"]).resolve() != git.root:
         raise ReviewError("wrong_worktree", "Session belongs to a different working tree")
+
+
+def ensure_session_kind(session: Mapping[str, Any], expected: str) -> None:
+    actual = session.get("kind", "fix")
+    if actual != expected:
+        raise ReviewError(
+            "wrong_session_kind",
+            f"This command requires a {expected} session, not a {actual} session",
+        )
 
 
 def read_session(cwd: Path, runner: Runner, session_id: str) -> dict[str, Any]:
@@ -1299,6 +2003,416 @@ def relocate_session(
     }
 
 
+def review_summary_marker(session_id: str) -> str:
+    return f"<!-- codex-pr-review:{session_id} -->"
+
+
+def review_inline_marker(session_id: str, index: int) -> str:
+    return f"<!-- codex-pr-review:{session_id}:finding-{index} -->"
+
+
+def _normalized_words(value: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9_]+", value.lower()))
+
+
+def _review_findings(path: Path, valid_lines: Mapping[str, set[int]]) -> list[dict[str, Any]]:
+    raw_findings = load_json_file(path, "Review findings file", list)
+    if len(raw_findings) > MAX_REVIEW_COMMENTS:
+        raise ReviewError(
+            "too_many_review_comments",
+            f"At most {MAX_REVIEW_COMMENTS} high-signal inline comments may be published",
+        )
+    required = {
+        "path",
+        "line",
+        "title",
+        "severity",
+        "confidence",
+        "category",
+        "problem",
+        "reproduction",
+        "fix",
+        "evidence",
+    }
+    allowed = required | {"start_line"}
+    findings: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_findings):
+        if not isinstance(raw, dict) or set(raw) - allowed or required - set(raw):
+            raise ReviewError(
+                "invalid_review_finding",
+                f"Finding {index} must contain exactly the required reviewer fields",
+                {"required": sorted(required), "optional": ["start_line"]},
+            )
+        review_path = raw["path"]
+        if not isinstance(review_path, str):
+            raise ReviewError("invalid_review_path", f"Finding {index} path must be a string")
+        safe_repo_path(Path("/"), review_path)
+        if review_path not in valid_lines:
+            raise ReviewError("review_path_not_changed", f"Finding {index} does not target a reviewable changed file")
+        line = raw["line"]
+        start_line = raw.get("start_line", line)
+        if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
+            raise ReviewError("invalid_review_line", f"Finding {index} line must be a positive integer")
+        if isinstance(start_line, bool) or not isinstance(start_line, int) or start_line <= 0 or start_line > line:
+            raise ReviewError("invalid_review_line", f"Finding {index} start_line must be positive and no greater than line")
+        missing_lines = [value for value in range(start_line, line + 1) if value not in valid_lines[review_path]]
+        if missing_lines:
+            raise ReviewError(
+                "review_line_not_in_diff",
+                f"Finding {index} targets lines that are not on the current diff's right side",
+                {"path": review_path, "lines": missing_lines[:20]},
+            )
+        severity = raw["severity"]
+        if severity not in REVIEW_SEVERITIES:
+            raise ReviewError("invalid_review_severity", f"Finding {index} severity must be suggestion, warning, or blocker")
+        confidence = raw["confidence"]
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+            raise ReviewError("invalid_review_confidence", f"Finding {index} confidence must be between 0 and 1")
+        if confidence < REVIEW_CONFIDENCE_FLOOR:
+            raise ReviewError(
+                "review_confidence_too_low",
+                f"Finding {index} is below the {REVIEW_CONFIDENCE_FLOOR:.1f} publication threshold",
+            )
+        category = raw["category"]
+        if not isinstance(category, str) or not REVIEW_CATEGORY_RE.fullmatch(category):
+            raise ReviewError("invalid_review_category", f"Finding {index} category is invalid")
+        text: dict[str, str] = {}
+        for key in ("title", "problem", "reproduction", "fix", "evidence"):
+            value = raw[key]
+            if not isinstance(value, str):
+                raise ReviewError("invalid_review_text", f"Finding {index} {key} must be a string")
+            value = reject_sensitive(value.strip(), f"Finding {index} {key}")
+            if not value or len(value) > 4000:
+                raise ReviewError("invalid_review_text", f"Finding {index} {key} must be nonempty and at most 4000 characters")
+            text[key] = value
+        body = (
+            f"**[{severity} · {category}] {text['title']}**\n\n"
+            f"1. 问题是什么：{text['problem']}\n"
+            f"2. 如何复现：{text['reproduction']}\n"
+            f"3. 如何修复：{text['fix']}\n"
+            f"4. 证据：{text['evidence']}\n\n"
+            f"置信度：{float(confidence):.2f}"
+        )
+        if len(body) > 10000:
+            raise ReviewError("review_comment_too_large", f"Finding {index} renders beyond 10000 characters")
+        findings.append(
+            {
+                "path": review_path,
+                "line": line,
+                "start_line": start_line,
+                "title": text["title"],
+                "severity": severity,
+                "confidence": float(confidence),
+                "category": category,
+                "body": body,
+            }
+        )
+    severity_rank = {"blocker": 2, "warning": 1, "suggestion": 0}
+    findings.sort(key=lambda item: (-severity_rank[item["severity"]], -item["confidence"], item["path"], item["line"]))
+    for index, finding in enumerate(findings):
+        for prior in findings[:index]:
+            same_range = (
+                finding["path"] == prior["path"]
+                and finding["line"] == prior["line"]
+                and finding["start_line"] == prior["start_line"]
+                and finding["category"] == prior["category"]
+            )
+            title_words = _normalized_words(finding["title"])
+            prior_words = _normalized_words(prior["title"])
+            title_similarity = (
+                len(title_words & prior_words) / len(title_words | prior_words)
+                if title_words and prior_words else 0.0
+            )
+            if same_range or (finding["path"] == prior["path"] and title_similarity >= 0.8):
+                raise ReviewError("duplicate_review_finding", "Review findings contain a likely duplicate")
+    return findings
+
+
+def _review_summary(path: Path) -> str:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ReviewError("review_summary_unreadable", f"Cannot read review summary: {exc}") from exc
+    value = reject_sensitive(value, "Review summary")
+    if not value or len(value) > 12000:
+        raise ReviewError("invalid_review_summary", "Review summary must be nonempty and at most 12000 characters")
+    return value
+
+
+def _validate_review_live(
+    session: Mapping[str, Any],
+    git: Git,
+    github: GitHub,
+) -> tuple[dict[str, Any], str, dict[str, set[int]]]:
+    ensure_session_kind(session, "review")
+    if git.head() != session["expected_head"]:
+        raise ReviewError("local_head_drift", "Local HEAD no longer matches the analyzed PR head")
+    status = git.status_entries()
+    if status:
+        raise ReviewError("working_tree_changed", "Reviewer mode requires a clean working tree", status)
+    fresh_pr = github.pr(str(session["pr"]["number"]))
+    if (
+        fresh_pr["url"] != session["pr"]["url"]
+        or fresh_pr["head_repository"] != session["pr"]["head_repository"]
+        or fresh_pr["base_repository"] != session["pr"]["base_repository"]
+    ):
+        raise ReviewError("pr_identity_drift", "Pull request identity changed; restart the review")
+    if fresh_pr["head_oid"] != session["expected_head"] or fresh_pr["base_oid"] != session["expected_base"]:
+        raise ReviewError("pr_revision_drift", "PR base or head changed; restart the review")
+    ensure_review_feedback_unchanged(session, fresh_pr)
+    fresh_threads = github.threads(session["repository"]["name_with_owner"], session["pr"]["number"])
+    current = {thread["thread_id"]: thread_fingerprint(thread) for thread in fresh_threads}
+    if current != session.get("thread_fingerprints", {}):
+        raise ReviewError("thread_drift", "Review threads changed; restart the review")
+    current_diff_base = git.merge_base(session["expected_base"], session["expected_head"])
+    if current_diff_base != session["diff_base"]:
+        raise ReviewError("review_diff_drift", "PR merge base differs from the review snapshot")
+    changed_paths = git.review_changed_paths(session["diff_base"], session["expected_head"])
+    if changed_paths != session["changed_paths"]:
+        raise ReviewError("review_diff_drift", "Changed paths differ from the review snapshot")
+    raw_diff = git.review_diff(session["diff_base"], session["expected_head"])
+    return fresh_pr, raw_diff, git.reviewable_right_lines(session["diff_base"], session["expected_head"])
+
+
+def get_review_diff(cwd: Path, runner: Runner, session_id: str) -> dict[str, Any]:
+    git, github, _repo = repository_context(cwd, runner)
+    store = SessionStore(git.git_dir())
+    with store.lock(exclusive=False):
+        session = store.load(session_id)
+        ensure_same_repo(session, git)
+        fresh_pr, raw_diff, _valid_lines = _validate_review_live(session, git, github)
+    return {
+        "ok": True,
+        "operation": "review-diff",
+        "session_id": session_id,
+        "pr": fresh_pr,
+        "changed_paths": session["changed_paths"],
+        "diff_sha256": hashlib.sha256(raw_diff.encode("utf-8")).hexdigest(),
+        "diff": redact(raw_diff),
+    }
+
+
+def build_review_plan(
+    session: Mapping[str, Any],
+    git: Git,
+    github: GitHub,
+    findings_file: Path,
+    summary_file: Path,
+) -> dict[str, Any]:
+    fresh_pr, raw_diff, valid_lines = _validate_review_live(session, git, github)
+    findings = _review_findings(findings_file, valid_lines)
+    summary = _review_summary(summary_file)
+    marker_value = review_summary_marker(session["session_id"])
+    counts = {severity: sum(item["severity"] == severity for item in findings) for severity in REVIEW_SEVERITIES}
+    summary_body = (
+        "## Codex PR review\n\n"
+        f"{summary}\n\n"
+        f"覆盖：{len(session['changed_paths'])} 个变更文件；"
+        f"发现：{counts['blocker']} blocker / {counts['warning']} warning / {counts['suggestion']} suggestion。\n\n"
+        f"{marker_value}"
+    )
+    comments: list[dict[str, Any]] = []
+    for index, finding in enumerate(findings, start=1):
+        comment: dict[str, Any] = {
+            "path": finding["path"],
+            "line": finding["line"],
+            "side": "RIGHT",
+            "body": finding["body"] + "\n\n" + review_inline_marker(session["session_id"], index),
+            "severity": finding["severity"],
+            "confidence": finding["confidence"],
+            "category": finding["category"],
+            "title": finding["title"],
+        }
+        if finding["start_line"] != finding["line"]:
+            comment["start_line"] = finding["start_line"]
+            comment["start_side"] = "RIGHT"
+        comments.append(comment)
+    plan: dict[str, Any] = {
+        "version": VERSION,
+        "kind": "pr-review-comment",
+        "session_id": session["session_id"],
+        "intake_digest": session["intake_digest"],
+        "repository": session["repository"]["name_with_owner"],
+        "pr_number": session["pr"]["number"],
+        "pr_url": session["pr"]["url"],
+        "base_oid": session["expected_base"],
+        "diff_base": session["diff_base"],
+        "commit_id": session["expected_head"],
+        "event": "COMMENT",
+        "summary_body": summary_body,
+        "summary_body_sha256": hashlib.sha256(summary_body.encode("utf-8")).hexdigest(),
+        "comments": comments,
+        "finding_counts": counts,
+        "changed_paths": session["changed_paths"],
+        "diff_sha256": hashlib.sha256(raw_diff.encode("utf-8")).hexdigest(),
+        "review_feedback_fingerprint": review_feedback_fingerprint(fresh_pr),
+        "thread_fingerprints": session["thread_fingerprints"],
+        "status_checks": fresh_pr["review_context"].get("status_checks") or [],
+        "policy": {
+            "confidence_floor": REVIEW_CONFIDENCE_FLOOR,
+            "max_comments": MAX_REVIEW_COMMENTS,
+            "allowed_severities": list(REVIEW_SEVERITIES),
+            "human_approval_required": True,
+            "github_event_fixed": "COMMENT",
+        },
+    }
+    plan["digest"] = digest(plan)
+    return plan
+
+
+def prepare_review(
+    cwd: Path,
+    runner: Runner,
+    session_id: str,
+    findings_file: Path,
+    summary_file: Path,
+) -> dict[str, Any]:
+    git, github, _repo = repository_context(cwd, runner)
+    store = SessionStore(git.git_dir())
+    with store.lock(exclusive=False):
+        session = store.load(session_id)
+        ensure_same_repo(session, git)
+        ensure_session_kind(session, "review")
+        if session["publication"]["status"] != "not_started":
+            raise ReviewError("publication_started", "The review publication has already started")
+        plan = build_review_plan(session, git, github, findings_file, summary_file)
+    return {
+        "ok": True,
+        "operation": "prepare-review",
+        "status": "approval_required",
+        "approval_phrase": f"Approve PR review {plan['digest']}",
+        "plan": plan,
+    }
+
+
+def _stored_review_plan(publication: Mapping[str, Any]) -> dict[str, Any]:
+    plan = publication.get("plan")
+    if not isinstance(plan, dict):
+        raise ReviewError("stored_plan_missing", "The approved review plan is missing")
+    material = {key: value for key, value in plan.items() if key != "digest"}
+    if digest(material) != plan.get("digest"):
+        raise ReviewError("stored_plan_corrupt", "Stored approved review plan failed its digest check")
+    if plan.get("event") != "COMMENT":
+        raise ReviewError("unsafe_review_event", "Reviewer publication is restricted to GitHub COMMENT reviews")
+    return plan
+
+
+def _validate_published_review(review: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[str, Any]:
+    if review.get("commit_id") != plan["commit_id"] or str(review.get("state") or "").upper() != "COMMENTED":
+        raise ReviewError(
+            "review_marker_collision",
+            "A review marker exists, but its commit or state does not match the approved COMMENT plan",
+        )
+    return dict(review)
+
+
+def _find_published_review(
+    github: GitHub,
+    session: Mapping[str, Any],
+    plan: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    expected = review_summary_marker(session["session_id"])
+    matches = [
+        review
+        for review in github.pull_request_reviews(session["repository"]["name_with_owner"], session["pr"]["number"])
+        if expected in (review.get("body") or "")
+    ]
+    if len(matches) > 1:
+        raise ReviewError("duplicate_published_reviews", "Multiple GitHub reviews carry this session marker")
+    return _validate_published_review(matches[0], plan) if matches else None
+
+
+def publish_review(
+    cwd: Path,
+    runner: Runner,
+    session_id: str,
+    *,
+    plan_digest: str | None,
+    findings_file: Path | None,
+    summary_file: Path | None,
+    retry: bool,
+) -> dict[str, Any]:
+    git, github, _repo = repository_context(cwd, runner)
+    store = SessionStore(git.git_dir())
+    with store.lock():
+        session = store.load(session_id)
+        ensure_same_repo(session, git)
+        ensure_session_kind(session, "review")
+        publication = session["publication"]
+        if publication["status"] == "complete":
+            return {"ok": True, "operation": "retry-review" if retry else "publish-review", "idempotent": True, "session": session}
+        if publication["status"] == "not_started":
+            if retry:
+                raise ReviewError("publication_not_started", "Approve and publish an exact review plan first")
+            if not plan_digest or findings_file is None or summary_file is None:
+                raise ReviewError("approval_digest_required", "The digest and both approved input files are required")
+            plan = build_review_plan(session, git, github, findings_file, summary_file)
+            if plan["digest"] != plan_digest:
+                raise ReviewError(
+                    "plan_digest_mismatch",
+                    "Review content or live PR state changed after preview",
+                    {"expected": plan["digest"], "supplied": plan_digest},
+                )
+            publication.update(
+                {
+                    "status": "approved",
+                    "plan": plan,
+                    "digest": plan_digest,
+                    "approved_at": utc_now(),
+                    "last_error": None,
+                }
+            )
+            store.save(session)
+        plan = _stored_review_plan(publication)
+        try:
+            existing = _find_published_review(github, session, plan)
+            if existing is None:
+                _validate_review_live(session, git, github)
+                api_comments = [
+                    {
+                        key: comment[key]
+                        for key in ("path", "line", "side", "body", "start_line", "start_side")
+                        if key in comment
+                    }
+                    for comment in plan["comments"]
+                ]
+                publication["status"] = "posting"
+                publication["post_attempted_at"] = utc_now()
+                store.save(session)
+                try:
+                    existing = github.create_pull_request_review(
+                        plan["repository"],
+                        plan["pr_number"],
+                        {
+                            "commit_id": plan["commit_id"],
+                            "body": plan["summary_body"],
+                            "event": "COMMENT",
+                            "comments": api_comments,
+                        },
+                    )
+                    existing = _validate_published_review(existing, plan)
+                except ReviewError:
+                    existing = _find_published_review(github, session, plan)
+                    if existing is None:
+                        raise
+            publication["review_result"] = existing
+            publication["status"] = "complete"
+            publication["completed_at"] = utc_now()
+            publication["last_error"] = None
+            store.save(session)
+        except ReviewError as error:
+            publication["status"] = "interrupted"
+            publication["last_error"] = error.as_json()
+            store.save(session)
+            raise
+        return {
+            "ok": True,
+            "operation": "retry-review" if retry else "publish-review",
+            "idempotent": False,
+            "session": session,
+        }
+
+
 def all_recorded_paths(session: Mapping[str, Any]) -> list[str]:
     paths: set[str] = set()
     for thread_id in session["thread_order"]:
@@ -1327,7 +2441,7 @@ def reply_preview(session: Mapping[str, Any], thread_id: str, failures: list[dic
         sections.append("Changed files: " + ", ".join(entry["paths"]))
         summaries = [f"{test['command']}: {test['status']}" + (f" ({test['summary']})" if test["summary"] else "") for test in entry["tests"]]
         sections.append("Tests: " + "; ".join(summaries))
-        relevant = [item for item in failures if item["thread_id"] == thread_id]
+        relevant = [item for item in failures if item["thread_id"] in {thread_id, "(session)"}]
         if relevant:
             sections.append("Test override: publishing despite " + "; ".join(f"{item['command']} ({item['status']})" for item in relevant) + ".")
         sections.append("Pushed commit: <PUSHED_COMMIT_SHA>")
@@ -1343,14 +2457,66 @@ def render_reply(preview: str, commit_sha: str | None) -> str:
     return preview
 
 
+def fix_quality_summary(session: Mapping[str, Any], thread_ids: Sequence[str]) -> dict[str, Any]:
+    assessments = {
+        thread_id: session["threads"][thread_id].get("assessment")
+        for thread_id in thread_ids
+    }
+    missing = [thread_id for thread_id, value in assessments.items() if not value]
+    low_confidence = [
+        thread_id
+        for thread_id, value in assessments.items()
+        if value and value["confidence"] < REVIEW_CONFIDENCE_FLOOR
+    ]
+    nitpicks = [
+        thread_id for thread_id, value in assessments.items() if value and value["severity"] == "nitpick"
+    ]
+    plausible = [
+        thread_id for thread_id, value in assessments.items() if value and value["evidence_grade"] == "plausible"
+    ]
+    unsupported = [
+        thread_id for thread_id, value in assessments.items() if value and value["evidence_grade"] == "unsupported"
+    ]
+    duplicates = {
+        thread_id: value["duplicate_of"]
+        for thread_id, value in assessments.items()
+        if value and value.get("duplicate_of")
+    }
+    return {
+        "policy": dict(session.get("quality_policy") or {}),
+        "assessment_coverage": {
+            "assessed": len(thread_ids) - len(missing),
+            "total": len(thread_ids),
+            "missing_threads": missing,
+        },
+        "low_confidence_threads": low_confidence,
+        "nitpick_threads": nitpicks,
+        "plausible_threads": plausible,
+        "unsupported_threads": unsupported,
+        "duplicate_threads": duplicates,
+        "attention_required": bool(missing or low_confidence or nitpicks or plausible or duplicates),
+    }
+
+
 def build_plan(
     session: Mapping[str, Any],
     git: Git,
     github: GitHub,
     commit_message: str,
 ) -> dict[str, Any]:
-    if any(session["threads"][item]["state"] != "ready" for item in session["thread_order"]):
-        raise ReviewError("decisions_incomplete", "Every session thread needs a confirmed decision and reply")
+    ensure_session_kind(session, "fix")
+    if session.get("legacy_session"):
+        raise ReviewError(
+            "legacy_session_requires_restart",
+            "This pre-v2 session lacks a bound intake and must be restarted before a new publication plan is prepared",
+        )
+    if any(session["threads"][item]["state"] not in {"ready", "deferred"} for item in session["thread_order"]):
+        raise ReviewError("decisions_incomplete", "Every session thread needs a confirmed decision or deferral")
+    publishable_threads = [
+        item for item in session["thread_order"] if session["threads"][item]["state"] == "ready"
+    ]
+    if not publishable_threads:
+        raise ReviewError("nothing_to_publish", "Every thread is deferred; there is no publication plan")
     fresh_pr = github.pr(str(session["pr"]["number"]))
     if fresh_pr["url"] != session["pr"]["url"] or fresh_pr["head_repository"] != session["pr"]["head_repository"]:
         raise ReviewError("pr_identity_drift", "Pull request identity changed")
@@ -1360,11 +2526,14 @@ def build_plan(
             "Pull request head changed; reanalysis is required",
             {"expected": session["expected_head"], "actual": fresh_pr["head_oid"]},
         )
+    ensure_review_feedback_unchanged(session, fresh_pr)
     if git.head() != session["expected_head"]:
         raise ReviewError("local_head_drift", "Local HEAD no longer matches the analyzed PR head")
     fresh_threads = github.threads(session["repository"]["name_with_owner"], session["pr"]["number"])
     by_id = {item["thread_id"]: item for item in fresh_threads}
     stale: list[dict[str, str]] = []
+    new_thread_ids = sorted(set(by_id) - set(session["thread_order"]))
+    stale.extend({"thread_id": item, "reason": "new_unresolved_thread"} for item in new_thread_ids)
     for thread_id in session["thread_order"]:
         current = by_id.get(thread_id)
         if current is None:
@@ -1381,27 +2550,62 @@ def build_plan(
             "Working-tree changes do not exactly match recorded paths",
             {"recorded_paths": recorded_paths, "actual_paths": actual_paths},
         )
-    has_changes = any(session["threads"][item]["decision"] == "change" for item in session["thread_order"])
+    has_changes = any(session["threads"][item]["decision"] == "change" for item in publishable_threads)
     if has_changes and not commit_message.strip():
         raise ReviewError("commit_message_required", "A nonempty commit message is required")
     if redact(commit_message) != commit_message:
         raise ReviewError("sensitive_commit_message", "Commit message contains token-shaped content")
     blockers = test_blockers(session)
+    if has_changes:
+        used_commands = {
+            test["command"]
+            for thread_id in publishable_threads
+            for test in session["threads"][thread_id].get("tests") or []
+        }
+        blockers.extend(
+            {"thread_id": "(session)", "status": "not_run", "command": command}
+            for command in session.get("approved_test_commands") or []
+            if command not in used_commands
+        )
+    used_evidence = {
+        test["evidence_id"]: {
+            key: test[key]
+            for key in (
+                "command",
+                "status",
+                "exit_code",
+                "started_at",
+                "finished_at",
+                "duration_seconds",
+                "stdout_sha256",
+                "stderr_sha256",
+                "summary",
+                "repository_changed",
+                "execution_error",
+            )
+        }
+        for thread_id in publishable_threads
+        for test in session["threads"][thread_id].get("tests") or []
+    }
     push_remote = git.choose_push_remote(
         session["pr"]["head_repository"], github.host, session.get("push_remote_override")
     ) if has_changes else None
     full_commit_message = None
     if has_changes:
         full_commit_message = commit_message.strip() + f"\n\nCodex-Review-Fixer-Session: {session['session_id']}"
-    replies = [
-        {
-            "thread_id": thread_id,
-            "decision": session["threads"][thread_id]["decision"],
-            "body_preview": reply_preview(session, thread_id, blockers),
-            "will_resolve_after_reply": True,
-        }
-        for thread_id in session["thread_order"]
-    ]
+    replies = []
+    for thread_id in publishable_threads:
+        body = reply_preview(session, thread_id, blockers)
+        replies.append(
+            {
+                "thread_id": thread_id,
+                "decision": session["threads"][thread_id]["decision"],
+                "assessment": session["threads"][thread_id].get("assessment"),
+                "body_preview": body,
+                "body_template_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                "will_resolve_after_reply": session["threads"][thread_id]["resolution"] == "resolve",
+            }
+        )
     plan = {
         "version": VERSION,
         "session_id": session["session_id"],
@@ -1409,6 +2613,8 @@ def build_plan(
         "pr_number": session["pr"]["number"],
         "pr_url": session["pr"]["url"],
         "expected_pr_head": session["expected_head"],
+        "review_feedback_fingerprint": session["review_feedback_fingerprint"],
+        "status_checks": (fresh_pr.get("review_context") or {}).get("status_checks") or [],
         "target": {
             "head_repository": session["pr"]["head_repository"],
             "branch": session["pr"]["head_ref"],
@@ -1417,6 +2623,12 @@ def build_plan(
         "commit": {"required": has_changes, "message": full_commit_message, "paths": recorded_paths},
         "path_fingerprints": git.path_fingerprints(recorded_paths),
         "tests": {"blockers": blockers, "override_required": bool(blockers)},
+        "approved_test_commands": list(session.get("approved_test_commands") or []),
+        "test_evidence": used_evidence,
+        "quality": fix_quality_summary(session, publishable_threads),
+        "deferred_threads": [
+            item for item in session["thread_order"] if session["threads"][item]["state"] == "deferred"
+        ],
         "threads": [
             {
                 "thread_id": thread_id,
@@ -1426,7 +2638,7 @@ def build_plan(
             for thread_id in session["thread_order"]
         ],
         "replies": replies,
-        "side_effect_order": (["commit", "push", "verify_remote_head"] if has_changes else ["refetch_remote_head"]) + ["reply_then_resolve_each_thread"],
+        "side_effect_order": (["commit", "push", "verify_remote_head"] if has_changes else ["refetch_remote_head"]) + ["reply_then_apply_each_thread_resolution_policy"],
     }
     plan["digest"] = digest(plan)
     return plan
@@ -1438,6 +2650,7 @@ def prepare_publish(cwd: Path, runner: Runner, session_id: str, commit_message: 
     with store.lock(exclusive=False):
         session = store.load(session_id)
         ensure_same_repo(session, git)
+        ensure_session_kind(session, "fix")
         if session["publication"]["status"] != "not_started":
             raise ReviewError("publication_started", "Use retry-publish after publication has started")
         plan = build_plan(session, git, github, commit_message)
@@ -1457,11 +2670,19 @@ def find_marker_comment(thread: Mapping[str, Any], expected_marker: str) -> dict
 
 
 def verify_threads_for_resume(session: Mapping[str, Any], github: GitHub) -> dict[str, dict[str, Any]]:
+    ensure_review_feedback_unchanged(session, github.pr(str(session["pr"]["number"])))
     fresh = github.threads(session["repository"]["name_with_owner"], session["pr"]["number"])
     by_id = {thread["thread_id"]: thread for thread in fresh}
+    new_thread_ids = sorted(set(by_id) - set(session["thread_order"]))
+    if new_thread_ids:
+        raise ReviewError(
+            "thread_drift",
+            "New unresolved review threads appeared during publication",
+            [{"thread_id": item, "reason": "new_unresolved_thread"} for item in new_thread_ids],
+        )
     for thread_id in session["thread_order"]:
         entry = session["threads"][thread_id]
-        if entry.get("resolved"):
+        if entry.get("resolved") or entry.get("state") == "replied":
             continue
         current = by_id.get(thread_id)
         if current is None:
@@ -1534,12 +2755,15 @@ def publish_or_resume(
     with store.lock():
         session = store.load(session_id)
         ensure_same_repo(session, git)
+        ensure_session_kind(session, "fix")
         publication = session["publication"]
         if publication["status"] == "complete":
             return {"ok": True, "operation": "retry-publish" if retry else "publish", "idempotent": True, "session": session}
         if publication["status"] == "not_started":
             if retry:
                 raise ReviewError("publication_not_started", "Run publish with an explicitly approved plan digest first")
+            if not mode_allows_publish(session["intake"]):
+                raise ReviewError("mode_forbids_publish", "The confirmed intake mode does not allow publication")
             if not approved_digest:
                 raise ReviewError("approval_digest_required", "The exact approved plan digest is required")
             # Rebuild from live state at the last possible moment. This is the approval gate.
@@ -1580,9 +2804,13 @@ def publish_or_resume(
             save_publication_error(store, session, error)
             raise
         publication = session["publication"]
-        unresolved = [item for item in session["thread_order"] if not session["threads"][item].get("resolved")]
-        if unresolved:
-            error = ReviewError("publication_incomplete", "Some threads were not published successfully", {"threads": unresolved})
+        incomplete = [
+            item["thread_id"]
+            for item in publication["plan"]["replies"]
+            if session["threads"][item["thread_id"]].get("state") not in {"resolved", "replied"}
+        ]
+        if incomplete:
+            error = ReviewError("publication_incomplete", "Some threads were not published successfully", {"threads": incomplete})
             save_publication_error(store, session, error)
             raise error
         publication["status"] = "complete"
@@ -1658,9 +2886,10 @@ def _resume_publication(session: dict[str, Any], git: Git, github: GitHub, store
 
     by_id = verify_threads_for_resume(session, github)
     failures: list[dict[str, Any]] = []
-    for thread_id in session["thread_order"]:
+    for reply_plan in plan["replies"]:
+        thread_id = reply_plan["thread_id"]
         entry = session["threads"][thread_id]
-        if entry.get("resolved"):
+        if entry.get("resolved") or entry.get("state") == "replied":
             continue
         if git.changed_paths():
             raise ReviewError("working_tree_changed_during_publish", "Working tree changed during publication; stop for reanalysis")
@@ -1702,6 +2931,11 @@ def _resume_publication(session: dict[str, Any], git: Git, github: GitHub, store
                 store.save(session)
                 failures.append({"thread_id": thread_id, "operation": "reply", "error": error.as_json()})
                 continue
+        if not reply_plan["will_resolve_after_reply"]:
+            entry["state"] = "replied"
+            entry["error"] = None
+            store.save(session)
+            continue
         # A prior resolve may have succeeded just before interruption. Query first.
         # Drift and fetch failures are batch-fatal; only the resolve mutation itself
         # is isolated so other already-approved threads may continue.
@@ -1777,13 +3011,45 @@ def parser() -> argparse.ArgumentParser:
 
     inspect_parser = commands.add_parser("inspect")
     inspect_parser.add_argument("--pr")
+    inspect_parser.add_argument("--intake-file", required=True, type=Path)
+    inspect_parser.add_argument("--confirmed-intake-digest", required=True)
     inspect_parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
 
     start = commands.add_parser("session-start")
     start.add_argument("--pr")
     start.add_argument("--push-remote")
+    start.add_argument("--intake-file", required=True, type=Path)
+    start.add_argument("--confirmed-intake-digest", required=True)
     start.add_argument("--session-id", help=argparse.SUPPRESS)
     start.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+
+    review_start = commands.add_parser("review-start")
+    review_start.add_argument("--pr")
+    review_start.add_argument("--intake-file", required=True, type=Path)
+    review_start.add_argument("--confirmed-intake-digest", required=True)
+    review_start.add_argument("--session-id", help=argparse.SUPPRESS)
+    review_start.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+
+    review_diff = commands.add_parser("review-diff")
+    review_diff.add_argument("--session", required=True)
+    review_diff.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+
+    prepare_review_parser = commands.add_parser("prepare-review")
+    prepare_review_parser.add_argument("--session", required=True)
+    prepare_review_parser.add_argument("--findings-file", required=True, type=Path)
+    prepare_review_parser.add_argument("--summary-file", required=True, type=Path)
+    prepare_review_parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+
+    publish_review_parser = commands.add_parser("publish-review")
+    publish_review_parser.add_argument("--session", required=True)
+    publish_review_parser.add_argument("--plan-digest", required=True)
+    publish_review_parser.add_argument("--findings-file", required=True, type=Path)
+    publish_review_parser.add_argument("--summary-file", required=True, type=Path)
+    publish_review_parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+
+    retry_review_parser = commands.add_parser("retry-review")
+    retry_review_parser.add_argument("--session", required=True)
+    retry_review_parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
 
     show = commands.add_parser("session-show")
     show.add_argument("--session", required=True)
@@ -1797,10 +3063,12 @@ def parser() -> argparse.ArgumentParser:
     record = commands.add_parser("record")
     record.add_argument("--session", required=True)
     record.add_argument("--thread", required=True)
-    record.add_argument("--decision", required=True, choices=("change", "no-change"))
-    record.add_argument("--reply-file", required=True, type=Path)
+    record.add_argument("--decision", required=True, choices=("change", "no-change", "defer"))
+    record.add_argument("--resolution", choices=("resolve", "leave-open"))
+    record.add_argument("--reply-file", type=Path)
     record.add_argument("--paths-file", type=Path)
     record.add_argument("--tests-file", type=Path)
+    record.add_argument("--assessment-file", type=Path)
     record.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
 
     update = commands.add_parser("update-tests")
@@ -1808,6 +3076,23 @@ def parser() -> argparse.ArgumentParser:
     update.add_argument("--thread", required=True)
     update.add_argument("--tests-file", required=True, type=Path)
     update.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+
+    prepare_tests = commands.add_parser("prepare-test-plan")
+    prepare_tests.add_argument("--session", required=True)
+    prepare_tests.add_argument("--commands-file", required=True, type=Path)
+    prepare_tests.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+
+    approve_tests = commands.add_parser("approve-test-plan")
+    approve_tests.add_argument("--session", required=True)
+    approve_tests.add_argument("--commands-file", required=True, type=Path)
+    approve_tests.add_argument("--plan-digest", required=True)
+    approve_tests.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+
+    run_test = commands.add_parser("run-test")
+    run_test.add_argument("--session", required=True)
+    run_test.add_argument("--command", required=True)
+    run_test.add_argument("--timeout-seconds", type=int, default=300)
+    run_test.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
 
     prepare = commands.add_parser("prepare-publish")
     prepare.add_argument("--session", required=True)
@@ -1852,17 +3137,78 @@ def dispatch(args: argparse.Namespace, runner: Runner) -> dict[str, Any]:
     if args.command == "handoff-validate":
         return validate_handoff(args.handoff_file)
     if args.command == "inspect":
-        return inspect(cwd, runner, args.pr)
+        intake, intake_digest = confirmed_task_intake(args.intake_file, args.confirmed_intake_digest)
+        return inspect(cwd, runner, args.pr or intake["pr_url"], intake, intake_digest)
     if args.command == "session-start":
-        return create_session(cwd, runner, args.pr, args.push_remote, args.session_id)
+        intake, intake_digest = confirmed_task_intake(args.intake_file, args.confirmed_intake_digest)
+        return create_session(
+            cwd,
+            runner,
+            args.pr or intake["pr_url"],
+            args.push_remote,
+            intake,
+            intake_digest,
+            args.session_id,
+        )
+    if args.command == "review-start":
+        intake, intake_digest = confirmed_task_intake(args.intake_file, args.confirmed_intake_digest)
+        return create_review_session(
+            cwd,
+            runner,
+            args.pr or intake["pr_url"],
+            intake,
+            intake_digest,
+            args.session_id,
+        )
+    if args.command == "review-diff":
+        return get_review_diff(cwd, runner, args.session)
+    if args.command == "prepare-review":
+        return prepare_review(cwd, runner, args.session, args.findings_file, args.summary_file)
+    if args.command == "publish-review":
+        return publish_review(
+            cwd,
+            runner,
+            args.session,
+            plan_digest=args.plan_digest,
+            findings_file=args.findings_file,
+            summary_file=args.summary_file,
+            retry=False,
+        )
+    if args.command == "retry-review":
+        return publish_review(
+            cwd,
+            runner,
+            args.session,
+            plan_digest=None,
+            findings_file=None,
+            summary_file=None,
+            retry=True,
+        )
     if args.command == "session-show":
         return read_session(cwd, runner, args.session)
     if args.command == "session-relocate":
         return relocate_session(cwd, runner, args.session, args.previous_root)
     if args.command == "record":
-        return record_decision(cwd, runner, args.session, args.thread, args.decision, args.reply_file, args.paths_file, args.tests_file)
+        return record_decision(
+            cwd,
+            runner,
+            args.session,
+            args.thread,
+            args.decision,
+            args.resolution,
+            args.reply_file,
+            args.paths_file,
+            args.tests_file,
+            args.assessment_file,
+        )
     if args.command == "update-tests":
         return update_tests(cwd, runner, args.session, args.thread, args.tests_file)
+    if args.command == "prepare-test-plan":
+        return prepare_test_plan(cwd, runner, args.session, args.commands_file)
+    if args.command == "approve-test-plan":
+        return approve_test_plan(cwd, runner, args.session, args.commands_file, args.plan_digest)
+    if args.command == "run-test":
+        return run_approved_test(cwd, runner, args.session, args.command, args.timeout_seconds)
     if args.command == "prepare-publish":
         return prepare_publish(cwd, runner, args.session, args.commit_message)
     if args.command == "publish":
