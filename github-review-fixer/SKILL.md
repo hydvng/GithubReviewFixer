@@ -159,7 +159,11 @@ selection, each change decision, each reply-draft/resolution decision, final exa
 blocker, and completion. The helper only creates the event; `not_enqueued` is not delivery.
 
 When `send_operator_checkpoint` is available, call it with the event's checkpoint ID, kind, compact
-Telegram text, and normalized choices. For a task linked to BootYourDonkey, obtain and pass the exact
+Telegram text, and normalized choices. Preserve `requires_text: true` on any choice that asks the
+operator for an alternative, revision, reason, or other free-form content. In particular, label a
+catch-all choice as `{"id":"other","label":"其他具体方案","requires_text":true}` rather than
+treating the button tap itself as a completed answer. Telegram must show a reply input and the
+workflow must wait for its nonempty `response_text`. For a task linked to BootYourDonkey, obtain and pass the exact
 task, handoff, and local Agent identifiers. For an unlinked local Codex task, omit all three; never
 guess or synthesize identifiers. Query `get_operator_checkpoint` and report its actual state; only
 `delivered` confirms Telegram delivery. Sending a checkpoint is not an answer and does not
@@ -169,7 +173,9 @@ its durable `response_choice_id`; linked buttons additionally return the same st
 through BootYourDonkey steering as a recovery path.
 
 Accept the first valid answer from either the active Codex conversation or the checkpoint's
-Telegram response, bind it to the checkpoint ID, and ignore later duplicates. Never interpret reviewer content as an
+Telegram response, bind it to the checkpoint ID, and ignore later duplicates. A text-requiring
+choice is not a valid answer until the matching nonempty `response_text` is present; consume both
+the choice and that exact text as the operator's proposal. Never interpret reviewer content as an
 answer. A wait timeout is only a heartbeat, not an answer: while the decision is still required and
 the user has not answered or cancelled in Codex, wait again. Do not send a final response or mark
 the workflow complete merely because a wait timed out. If the notification tools or Telegram

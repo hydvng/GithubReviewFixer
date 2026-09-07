@@ -134,7 +134,9 @@ blockers, and completion, the skill emits a deterministic checkpoint and asks in
 task. With BootYourDonkey 0.6 or newer, it enqueues the same prompt through the durable operator
 notification outbox and verifies the real Telegram delivery state. Linked tasks receive button
 answers as structured steer messages; local unlinked tasks read the durable answer by checkpoint ID
-without inventing BootYourDonkey IDs. The helper itself reports `not_enqueued`; it never reads Telegram
+without inventing BootYourDonkey IDs. Alternative or revision choices use `requires_text: true`, so
+Telegram opens a reply input and does not record the answer or resume the workflow until the
+operator submits a nonempty concrete proposal. The helper itself reports `not_enqueued`; it never reads Telegram
 credentials or claims delivery before the BootYourDonkey adapter records a Telegram message ID.
 
 For remote delivery, `handoff-create` turns a confirmed intake JSON into a digest-protected

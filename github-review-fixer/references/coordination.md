@@ -79,8 +79,9 @@ Example files and invocation:
 ```json
 [
   {"id":"approve","label":"Approve proposed change"},
-  {"id":"revise","label":"Request a revision"},
-  {"id":"decline","label":"Decline with a reason"}
+  {"id":"revise","label":"Request a revision","requires_text":true},
+  {"id":"other","label":"其他具体方案","requires_text":true},
+  {"id":"decline","label":"Decline with a reason","requires_text":true}
 ]
 ```
 
@@ -99,7 +100,7 @@ Always put the checkpoint prompt in the active Codex task. Call `send_operator_c
 - `checkpoint_id`: `checkpoint.checkpoint_id`
 - `kind`: `checkpoint.kind`
 - `body`: `delivery.telegram_text`
-- `choices`: `checkpoint.choices`, retaining only `id` and `label`
+- `choices`: `checkpoint.choices`, retaining `id`, `label`, and `requires_text` when present
 - for a linked task, the exact `task_id`, `handoff_id`, and `target_agent_id` obtained from
   `get_control_snapshot` or `get_handoff`
 - for an unlinked local Codex task, omit all three identifiers; never guess or synthesize them
@@ -112,11 +113,13 @@ message but the response was lost; do not enqueue a different checkpoint ID mere
 
 For every interactive checkpoint, linked or unlinked, keep the calling Codex turn active and call
 `wait_operator_checkpoint` with the same checkpoint ID. An outcome of `responded` returns the
-durable choice ID and label. A timeout is only a heartbeat, not an answer: while the decision is
+durable choice ID and label. A choice marked `requires_text` remains unanswered after its button is
+tapped and becomes valid only after Telegram returns a nonempty `response_text`; consume that exact
+text as the user's proposal. A timeout is only a heartbeat, not an answer: while the decision is
 still required and the user has not answered or cancelled in Codex, call the wait tool again. Do
 not send a final response or mark the workflow complete merely because a wait timed out. Telegram
-choice buttons on a linked checkpoint also send one structured steer response containing the
-checkpoint ID, choice ID, and label to that task as a recovery path. Match every answer to the
+choice buttons on a linked checkpoint send one structured steer response only after the complete
+choice, including any required text, is recorded. Match every answer to the
 checkpoint ID and one explicit choice, and ignore the duplicate delivery. Never pass Telegram
 credentials to this helper or the notification tool.
 

@@ -528,10 +528,10 @@ def mode_allows_review_publish(intake: Mapping[str, Any]) -> bool:
     return intake["mode"] == "review"
 
 
-def normalize_choices(value: Any) -> list[dict[str, str]]:
+def normalize_choices(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not value:
         raise ReviewError("invalid_choices", "Choices must be a nonempty JSON array")
-    result: list[dict[str, str]] = []
+    result: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in value:
         if not isinstance(item, dict):
@@ -548,6 +548,14 @@ def normalize_choices(value: Any) -> list[dict[str, str]]:
             if not isinstance(description, str):
                 raise ReviewError("invalid_choice_description", "Choice descriptions must be strings")
             normalized["description"] = reject_sensitive(description.strip(), "Choice description")
+        requires_text = item.get("requires_text", False)
+        if not isinstance(requires_text, bool):
+            raise ReviewError(
+                "invalid_choice_requires_text",
+                "Choice requires_text must be a boolean",
+            )
+        if requires_text:
+            normalized["requires_text"] = True
         result.append(normalized)
         seen.add(identifier)
     return result
@@ -592,7 +600,11 @@ def create_checkpoint(
         "requires_response": requires_response,
     }
     checkpoint_id = digest(body)
-    option_text = "; ".join(f"{item['id']}={item['label']}" for item in choices)
+    option_text = "; ".join(
+        f"{item['id']}={item['label']}"
+        + (" (requires text)" if item.get("requires_text") is True else "")
+        for item in choices
+    )
     telegram_text = f"[Review Fixer/{kind}] {prompt}"
     if option_text:
         telegram_text += f"\nReply with one choice: {option_text}"

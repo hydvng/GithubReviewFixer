@@ -808,6 +808,39 @@ class ReviewCtlTests(unittest.TestCase):
         self.assertEqual([], self.runner.calls)
         self.assertFalse(Path("/tmp/checkpoint-pwned").exists())
 
+    def test_checkpoint_preserves_text_requirement_for_other_choice(self):
+        prompt = self.root / "prompt.txt"
+        choices = self.root / "choices.json"
+        prompt.write_text("Choose an approach", encoding="utf-8")
+        choices.write_text(
+            json.dumps(
+                [
+                    {"id": "approve", "label": "Approve"},
+                    {
+                        "id": "other",
+                        "label": "其他具体方案",
+                        "requires_text": True,
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+        result = reviewctl.create_checkpoint(
+            "change-approval", prompt, choices, None, [], None
+        )
+        self.assertTrue(result["checkpoint"]["choices"][1]["requires_text"])
+        self.assertIn(
+            "other=其他具体方案 (requires text)",
+            result["delivery"]["telegram_text"],
+        )
+
+    def test_checkpoint_rejects_non_boolean_text_requirement(self):
+        with self.assertRaises(reviewctl.ReviewError) as caught:
+            reviewctl.normalize_choices(
+                [{"id": "other", "label": "Other", "requires_text": "yes"}]
+            )
+        self.assertEqual("invalid_choice_requires_text", caught.exception.code)
+
     def test_checkpoint_instructions_keep_the_calling_turn_alive(self):
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         coordination = (SKILL_ROOT / "references" / "coordination.md").read_text(
